@@ -7,6 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/aus/proxyplease"
+	"github.com/gorilla/websocket"
 )
 
 func headerContains(header http.Header, name string, value string) bool {
@@ -25,11 +29,34 @@ func isWebSocketRequest(r *http.Request) bool {
 		headerContains(r.Header, "Upgrade", "websocket")
 }
 
+type WebSocketIO interface {
+	io.Reader
+	io.Writer
+}
+
+//type ReadWriter interface {
+//    Reader
+//    Writer
+//}
+
+func (ws *WebSocketIO) Read() io.Reader {
+	return websocket.JoinMessages(targetConn, "")
+}
+
 func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request, tlsConfig *tls.Config, clientConn *tls.Conn) {
 	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
 
-	// Connect to upstream
-	targetConn, err := tls.Dial("tcp", targetURL.Host, tlsConfig)
+	proxyUrl, _ := url.Parse("http://149.83.235.233:8080")
+	dialContext := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl})
+
+	d := websocket.Dialer{
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+		HandshakeTimeout: 45 * time.Second,
+		NetDialContext:   dialContext,
+	}
+	// wrap dial context with NTLM
+	targetConn, _, err := d.Dial(targetURL.String(), nil)
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
@@ -37,13 +64,18 @@ func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWr
 	defer targetConn.Close()
 
 	// Perform handshake
-	if err := proxy.websocketHandshake(ctx, req, targetConn, clientConn); err != nil {
+	// target := websocket.JoinMessages(targetConn, "")
+	target := &WebSocketIO{targetConn}
+	// 	Reader: websocket.JoinMessages(targetConn, ""),
+	// }
+	// }
+	if err := proxy.websocketHandshake(ctx, req, target, clientConn); err != nil {
 		ctx.Warnf("Websocket handshake error: %v", err)
 		return
 	}
 
 	// Proxy wss connection
-	proxy.proxyWebsocket(ctx, targetConn, clientConn)
+	proxy.proxyWebsocket(ctx, target, clientConn)
 }
 
 func (proxy *ProxyHttpServer) serveWebsocket(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request) {
@@ -90,7 +122,7 @@ func (proxy *ProxyHttpServer) websocketHandshake(ctx *ProxyCtx, req *http.Reques
 	// Read handshake response from target
 	resp, err := http.ReadResponse(targetTLSReader, req)
 	if err != nil {
-		ctx.Warnf("Error reading handhsake response  %v", err)
+		ctx.Warnf("Error reading handshake response  %v", err)
 		return err
 	}
 
