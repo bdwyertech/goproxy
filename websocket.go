@@ -2,6 +2,7 @@ package goproxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -30,19 +31,19 @@ func isWebSocketRequest(r *http.Request) bool {
 		headerContains(r.Header, "Upgrade", "websocket")
 }
 
+// type Dialer net.Dialer
+
 func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request, tlsConfig *tls.Config, clientConn *tls.Conn) {
 	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
 
 	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
-	dialContext := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl})
 
-	targetConn, err := net.Dial("tcp", proxyUrl.Host)
+	dialer := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl, TLSConfig: tlsConfig})
+	cctx, _ := context.WithCancel(context.Background())
+	targetConn, err := dialer(cctx, "tcp", targetURL.Host)
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
-	}
-	if err = dialWithConn(&targetConn, targetURL, dialContext); err != nil {
-		ctx.Warnf("Error dialing target")
 	}
 	defer targetConn.Close()
 
@@ -59,7 +60,11 @@ func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWr
 func (proxy *ProxyHttpServer) serveWebsocket(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request) {
 	targetURL := url.URL{Scheme: "ws", Host: req.URL.Host, Path: req.URL.Path}
 
-	targetConn, err := proxy.connectDial("tcp", targetURL.Host)
+	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
+
+	dialer := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl})
+	cctx, _ := context.WithCancel(context.Background())
+	targetConn, err := dialer(cctx, "tcp", targetURL.Host)
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
