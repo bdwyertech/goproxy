@@ -4,9 +4,14 @@ import (
 	"bufio"
 	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/aus/proxyplease"
+	"github.com/gorilla/websocket"
 )
 
 func headerContains(header http.Header, name string, value string) bool {
@@ -28,11 +33,16 @@ func isWebSocketRequest(r *http.Request) bool {
 func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request, tlsConfig *tls.Config, clientConn *tls.Conn) {
 	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
 
-	// Connect to upstream
-	targetConn, err := tls.Dial("tcp", targetURL.Host, tlsConfig)
+	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
+	dialContext := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl})
+
+	targetConn, err := net.Dial("tcp", proxyUrl.Host)
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
+	}
+	if err = dialWithConn(&targetConn, targetURL, dialContext); err != nil {
+		ctx.Warnf("Error dialing target")
 	}
 	defer targetConn.Close()
 
@@ -90,7 +100,7 @@ func (proxy *ProxyHttpServer) websocketHandshake(ctx *ProxyCtx, req *http.Reques
 	// Read handshake response from target
 	resp, err := http.ReadResponse(targetTLSReader, req)
 	if err != nil {
-		ctx.Warnf("Error reading handhsake response  %v", err)
+		ctx.Warnf("Error reading handshake response  %v", err)
 		return err
 	}
 
@@ -118,4 +128,18 @@ func (proxy *ProxyHttpServer) proxyWebsocket(ctx *ProxyCtx, dest io.ReadWriter, 
 	go cp(dest, source)
 	go cp(source, dest)
 	<-errChan
+}
+
+func dialWithConn(c *net.Conn, url url.URL, dialContext proxyplease.DialContext) (err error) {
+	d := websocket.Dialer{
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+		HandshakeTimeout: 45 * time.Second,
+		NetDial:          func(network, addr string) (net.Conn, error) { return *c, nil },
+		NetDialContext:   dialContext,
+	}
+
+	_, _, err = d.Dial(url.String(), nil)
+
+	return
 }
