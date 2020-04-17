@@ -33,7 +33,7 @@ func isWebSocketRequest(r *http.Request) bool {
 }
 
 func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request, tlsConfig *tls.Config, clientConn *tls.Conn) {
-	targetURL := url.URL{Scheme: "https", Host: req.URL.Host, Path: req.URL.Path}
+	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
 	log.Println(req.Header)
 
 	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
@@ -117,7 +117,7 @@ func (proxy *ProxyHttpServer) websocketHandshake(ctx *ProxyCtx, req *http.Reques
 	// Read handshake response from target
 	resp, err := http.ReadResponse(targetTLSReader, req)
 	if err != nil {
-		log.Println(resp)
+		log.Println("HANDSHAKE-RESPONSE", resp)
 		ctx.Warnf("Error reading handshake response  %v", err)
 		return err
 	}
