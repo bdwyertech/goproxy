@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,28 +32,35 @@ func isWebSocketRequest(r *http.Request) bool {
 		headerContains(r.Header, "Upgrade", "websocket")
 }
 
-// type Dialer net.Dialer
-
 func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWriter, req *http.Request, tlsConfig *tls.Config, clientConn *tls.Conn) {
-	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
+	targetURL := url.URL{Scheme: "https", Host: req.URL.Host, Path: req.URL.Path}
+	log.Println(req.Header)
 
 	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
 
-	dialer := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl, TLSConfig: tlsConfig})
-	cctx, _ := context.WithCancel(context.Background())
-	targetConn, err := dialer(cctx, "tcp", targetURL.Host)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetConn, err := proxyplease.NewDialContext(proxyplease.Proxy{
+		URL:       proxyUrl,
+		TLSConfig: tlsConfig,
+		Headers:   &req.Header,
+	})(cctx, "tcp", targetURL.String())
+	log.Println("REMOTEADDR:", targetConn.RemoteAddr())
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
 	}
 	defer targetConn.Close()
 
+	log.Println("WSS: PERFORMING HANDSHAKE:", targetURL.String())
 	// Perform handshake
 	if err := proxy.websocketHandshake(ctx, req, targetConn, clientConn); err != nil {
 		ctx.Warnf("Websocket handshake error: %v", err)
 		return
 	}
 
+	log.Println("WSS: PROXYING CONNECTION:", targetURL.String())
 	// Proxy wss connection
 	proxy.proxyWebsocket(ctx, targetConn, clientConn)
 }
@@ -62,9 +70,12 @@ func (proxy *ProxyHttpServer) serveWebsocket(ctx *ProxyCtx, w http.ResponseWrite
 
 	proxyUrl, _ := url.Parse("http://1.2.3.4:8080")
 
-	dialer := proxyplease.NewDialContext(proxyplease.Proxy{URL: proxyUrl})
-	cctx, _ := context.WithCancel(context.Background())
-	targetConn, err := dialer(cctx, "tcp", targetURL.Host)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targetConn, err := proxyplease.NewDialContext(proxyplease.Proxy{
+		URL:     proxyUrl,
+		Headers: &req.Header,
+	})(cctx, "tcp", targetURL.String())
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
@@ -99,12 +110,14 @@ func (proxy *ProxyHttpServer) websocketHandshake(ctx *ProxyCtx, req *http.Reques
 		ctx.Warnf("Error writing upgrade request: %v", err)
 		return err
 	}
+	log.Println("Handshake Written")
 
 	targetTLSReader := bufio.NewReader(targetSiteConn)
 
 	// Read handshake response from target
 	resp, err := http.ReadResponse(targetTLSReader, req)
 	if err != nil {
+		log.Println(resp)
 		ctx.Warnf("Error reading handshake response  %v", err)
 		return err
 	}
