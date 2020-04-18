@@ -29,12 +29,26 @@ func (proxy *ProxyHttpServer) serveWebsocketTLS(ctx *ProxyCtx, w http.ResponseWr
 	targetURL := url.URL{Scheme: "wss", Host: req.URL.Host, Path: req.URL.Path}
 
 	// Connect to upstream
-	targetConn, err := tls.Dial("tcp", targetURL.Host, tlsConfig)
+	conn, err := proxy.connectDial("tcp", targetURL.Host)
 	if err != nil {
 		ctx.Warnf("Error dialing target site: %v", err)
 		return
 	}
-	defer targetConn.Close()
+	defer conn.Close()
+	// Upgrade Connection to TLS
+	targetConn := tls.Client(conn, tlsConfig)
+	if err := targetConn.Handshake(); err != nil {
+		ctx.Warnf("Websocket TLS Handshake error: %v", err)
+		return
+	}
+	// TLS Certificate Validation
+	if !tlsConfig.InsecureSkipVerify {
+		desired := targetURL.Hostname()
+		if err := targetConn.VerifyHostname(desired); err != nil {
+			ctx.Warnf("Websocket TLS VerifyHostname error: %v, %v", desired, err)
+			return
+		}
+	}
 
 	// Perform handshake
 	if err := proxy.websocketHandshake(ctx, req, targetConn, clientConn); err != nil {
