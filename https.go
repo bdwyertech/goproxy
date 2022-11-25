@@ -133,11 +133,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}()
 		} else {
 			go func() {
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go copyOrWarn(ctx, targetSiteCon, proxyClient, &wg)
-				go copyOrWarn(ctx, proxyClient, targetSiteCon, &wg)
-				wg.Wait()
+				err = pipePair(proxyClient, targetSiteCon)
+				if err != nil {
+					ctx.Warnf("Error piping CONNECT request: %s", err)
+				}
 				proxyClient.Close()
 				targetSiteCon.Close()
 			}()
@@ -282,11 +281,47 @@ func httpError(w io.WriteCloser, ctx *ProxyCtx, err error) {
 	}
 }
 
-func copyOrWarn(ctx *ProxyCtx, dst io.Writer, src io.Reader, wg *sync.WaitGroup) {
-	if _, err := io.Copy(dst, src); err != nil {
-		ctx.Warnf("Error copying to client: %s", err)
-	}
-	wg.Done()
+const kPipeBufferSize = 32 * 1024
+
+func pipePair(conn net.Conn, stream io.ReadWriteCloser) error {
+	errChan := make(chan error, 2)
+	// TCP to stream
+	go func() {
+		buf := make([]byte, kPipeBufferSize)
+		for {
+			rn, err := conn.Read(buf)
+			if rn > 0 {
+				_, err := stream.Write(buf[:rn])
+				if err != nil {
+					errChan <- err
+					return
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+	// Stream to TCP
+	go func() {
+		buf := make([]byte, kPipeBufferSize)
+		for {
+			rn, err := stream.Read(buf)
+			if rn > 0 {
+				_, err := conn.Write(buf[:rn])
+				if err != nil {
+					errChan <- err
+					return
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+	return <-errChan
 }
 
 func copyAndClose(ctx *ProxyCtx, dst, src halfClosable, wg *sync.WaitGroup) {
