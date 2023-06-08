@@ -12,7 +12,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
@@ -72,13 +71,16 @@ func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (
 	return proxy.ConnectDial(network, addr)
 }
 
-type halfClosable interface {
-	net.Conn
-	CloseWrite() error
-	CloseRead() error
+func proxyCopy(errc chan<- error, dst, src net.Conn) {
+	_, err := io.Copy(dst, src)
+	if tcpConn, ok := dst.(*net.TCPConn); ok {
+		tcpConn.CloseWrite()
+	}
+	if tcpConn, ok := src.(*net.TCPConn); ok {
+		tcpConn.CloseRead()
+	}
+	errc <- err
 }
-
-var _ halfClosable = (*net.TCPConn)(nil)
 
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy, certStore: proxy.CertStore}
@@ -118,29 +120,20 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		ctx.Logf("Accepting CONNECT to %s", host)
 		proxyClient.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 
-		targetTCP, targetOK := targetSiteCon.(halfClosable)
-		proxyClientTCP, clientOK := proxyClient.(halfClosable)
-		if targetOK && clientOK {
-			// todo: make sure everything is fine
-			go func() {
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go copyAndClose(ctx, targetTCP, proxyClientTCP, &wg)
-				go copyAndClose(ctx, proxyClientTCP, targetTCP, &wg)
-				wg.Wait()
-				proxyClientTCP.Close()
-				targetTCP.Close()
-			}()
-		} else {
-			go func() {
-				err = pipePair(proxyClient, targetSiteCon)
-				if err != nil {
-					ctx.Warnf("Error piping CONNECT request: %s", err)
+		// todo: make sure everything is fine
+		go func() {
+			defer proxyClient.Close()
+			defer targetSiteCon.Close()
+
+			errc := make(chan error, 1)
+			go proxyCopy(errc, targetSiteCon, proxyClient)
+			go proxyCopy(errc, proxyClient, targetSiteCon)
+			for i := 0; i < 2; i++ {
+				if err := <-errc; err != nil {
+					return
 				}
-				proxyClient.Close()
-				targetSiteCon.Close()
-			}()
-		}
+			}
+		}()
 
 	case ConnectHijack:
 		ctx.Logf("Hijacking CONNECT to %s", host)
@@ -279,60 +272,6 @@ func httpError(w io.WriteCloser, ctx *ProxyCtx, err error) {
 	if err := w.Close(); err != nil {
 		ctx.Warnf("Error closing client connection: %s", err)
 	}
-}
-
-const kPipeBufferSize = 32 * 1024
-
-func pipePair(conn net.Conn, stream io.ReadWriteCloser) error {
-	errChan := make(chan error, 2)
-	// TCP to stream
-	go func() {
-		buf := make([]byte, kPipeBufferSize)
-		for {
-			rn, err := conn.Read(buf)
-			if rn > 0 {
-				_, err := stream.Write(buf[:rn])
-				if err != nil {
-					errChan <- err
-					return
-				}
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-		}
-	}()
-	// Stream to TCP
-	go func() {
-		buf := make([]byte, kPipeBufferSize)
-		for {
-			rn, err := stream.Read(buf)
-			if rn > 0 {
-				_, err := conn.Write(buf[:rn])
-				if err != nil {
-					errChan <- err
-					return
-				}
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-		}
-	}()
-	return <-errChan
-}
-
-func copyAndClose(ctx *ProxyCtx, dst, src halfClosable, wg *sync.WaitGroup) {
-	if _, err := io.Copy(dst, src); err != nil {
-		ctx.Warnf("Error copying to client: %s", err)
-	}
-
-	dst.CloseWrite()
-	src.CloseRead()
-
-	wg.Done()
 }
 
 func dialerFromEnv(proxy *ProxyHttpServer) func(network, addr string) (net.Conn, error) {
