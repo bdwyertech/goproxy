@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,8 +38,15 @@ func TestMitmConnectionClose(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.False(t, tc.directResponse, "direct response unexpectedly reached the upstream server")
+				// RemoveProxyHeaders must strip the header and reset r.Close;
+				// otherwise Go re-injects "Connection: close" on the wire.
+				assert.False(t, r.Close,
+					"upstream saw r.Close == true; Connection: close leaked through MITM proxy")
+				assert.Empty(t, r.Header.Get("Connection"),
+					"upstream received Connection: %s; hop-by-hop header leaked",
+					r.Header.Get("Connection"))
 				if tc.responseClose {
 					w.Header().Set("Connection", "close")
 				}
@@ -84,6 +93,13 @@ func TestMitmConnectionClose(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "ok", string(body))
 
+			// The proxy must echo Connection: close to
+			// the client when either side asked for it (RFC 9112 §9.6).
+			if tc.requestClose || tc.responseClose {
+				assert.True(t, resp.Close,
+					"proxy response should signal connection close (RFC 9112 §9.6)")
+			}
+
 			require.NoError(t, tlsConn.SetReadDeadline(time.Now().Add(time.Second)))
 			_, err = reader.ReadByte()
 			if tc.requestClose || tc.responseClose {
@@ -95,4 +111,54 @@ func TestMitmConnectionClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMitmReusesUpstreamConnOnRequestClose verifies that the proxy's transport
+// reuses upstream connections even when the client sends "Connection: close".
+// Without the r.Close fix, Connection: close leaks to the
+// upstream, which closes the connection, defeating keep-alive pooling.
+func TestMitmReusesUpstreamConnOnRequestClose(t *testing.T) {
+	var newConns atomic.Int32
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "ok")
+		}))
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, err := url.Parse(proxySrv.URL)
+	require.NoError(t, err)
+
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+
+	for i := range 2 {
+		req, err := http.NewRequestWithContext(
+			context.Background(), http.MethodGet, upstream.URL, http.NoBody)
+		require.NoError(t, err, "request %d", i)
+		req.Close = true
+
+		resp, err := client.Do(req)
+		require.NoError(t, err, "request %d", i)
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	assert.Equal(t, int32(1), newConns.Load(),
+		"proxy opened %d upstream connections; expected 1 "+
+			"(Connection: close leaked, defeating pooling)",
+		newConns.Load())
 }
